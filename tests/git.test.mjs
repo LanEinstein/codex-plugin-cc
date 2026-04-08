@@ -142,6 +142,24 @@ test("collectReviewContext falls back to lightweight context for larger adversar
   assert.match(context.content, /## Changed Files/);
 });
 
+test("collectReviewContext falls back to lightweight context for oversized single-file diffs", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'v1';\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), `export const value = '${"x".repeat(512)}';\n`);
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target, { maxInlineDiffBytes: 128 });
+
+  assert.equal(context.fileCount, 1);
+  assert.equal(context.inputMode, "self-collect");
+  assert.ok(context.diffBytes > 128);
+  assert.doesNotMatch(context.content, /xxx/);
+  assert.match(context.content, /## Changed Files/);
+});
+
 test("collectReviewContext keeps untracked file content in lightweight working tree context", () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);

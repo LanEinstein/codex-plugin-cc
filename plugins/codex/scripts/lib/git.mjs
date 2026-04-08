@@ -2,10 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { isProbablyText } from "./fs.mjs";
-import { runCommand, runCommandChecked } from "./process.mjs";
+import { formatCommandFailure, runCommand, runCommandChecked } from "./process.mjs";
 
 const MAX_UNTRACKED_BYTES = 24 * 1024;
 const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
+const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
 
 function git(cwd, args, options = {}) {
   return runCommand("git", args, { cwd, ...options });
@@ -25,6 +26,43 @@ function normalizeMaxInlineFiles(value) {
     return DEFAULT_INLINE_DIFF_MAX_FILES;
   }
   return Math.floor(parsed);
+}
+
+function normalizeMaxInlineDiffBytes(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_INLINE_DIFF_MAX_BYTES;
+  }
+  return Math.floor(parsed);
+}
+
+function measureGitOutputBytes(cwd, args, maxBytes) {
+  const result = git(cwd, args, { maxBuffer: maxBytes + 1 });
+  if (result.error?.code === "ENOBUFS") {
+    return maxBytes + 1;
+  }
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(formatCommandFailure(result));
+  }
+  return Buffer.byteLength(result.stdout, "utf8");
+}
+
+function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
+  let totalBytes = 0;
+  for (const args of argSets) {
+    const remainingBytes = maxBytes - totalBytes;
+    if (remainingBytes < 0) {
+      return maxBytes + 1;
+    }
+    totalBytes += measureGitOutputBytes(cwd, args, remainingBytes);
+    if (totalBytes > maxBytes) {
+      return totalBytes;
+    }
+  }
+  return totalBytes;
 }
 
 function buildBranchComparison(cwd, baseRef) {
@@ -262,17 +300,35 @@ export function collectReviewContext(cwd, target, options = {}) {
   const repoRoot = getRepoRoot(cwd);
   const currentBranch = getCurrentBranch(repoRoot);
   const maxInlineFiles = normalizeMaxInlineFiles(options.maxInlineFiles);
+  const maxInlineDiffBytes = normalizeMaxInlineDiffBytes(options.maxInlineDiffBytes);
   let details;
   let includeDiff;
+  let diffBytes;
 
   if (target.mode === "working-tree") {
     const state = getWorkingTreeState(repoRoot);
-    includeDiff = options.includeDiff ?? listUniqueFiles(state.staged, state.unstaged, state.untracked).length <= maxInlineFiles;
+    diffBytes = measureCombinedGitOutputBytes(
+      repoRoot,
+      [
+        ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"],
+        ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]
+      ],
+      maxInlineDiffBytes
+    );
+    includeDiff =
+      options.includeDiff ??
+      (listUniqueFiles(state.staged, state.unstaged, state.untracked).length <= maxInlineFiles &&
+        diffBytes <= maxInlineDiffBytes);
     details = collectWorkingTreeContext(repoRoot, state, { includeDiff });
   } else {
     const comparison = buildBranchComparison(repoRoot, target.baseRef);
     const fileCount = gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean).length;
-    includeDiff = options.includeDiff ?? fileCount <= maxInlineFiles;
+    diffBytes = measureGitOutputBytes(
+      repoRoot,
+      ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange],
+      maxInlineDiffBytes
+    );
+    includeDiff = options.includeDiff ?? (fileCount <= maxInlineFiles && diffBytes <= maxInlineDiffBytes);
     details = collectBranchContext(repoRoot, target.baseRef, { includeDiff, comparison });
   }
 
@@ -282,6 +338,7 @@ export function collectReviewContext(cwd, target, options = {}) {
     branch: currentBranch,
     target,
     fileCount: details.changedFiles.length,
+    diffBytes,
     inputMode: includeDiff ? "inline-diff" : "self-collect",
     collectionGuidance: buildAdversarialCollectionGuidance({ includeDiff }),
     ...details
