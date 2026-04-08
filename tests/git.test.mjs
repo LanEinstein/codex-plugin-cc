@@ -68,3 +68,43 @@ test("resolveReviewTarget requires an explicit base when no default branch can b
     /Unable to detect the repository default branch\. Pass --base <ref> or use --scope working-tree\./
   );
 });
+
+test("collectReviewContext keeps inline diffs for tiny adversarial reviews", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('INLINE_MARKER');\n");
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(context.inputMode, "inline-diff");
+  assert.equal(context.fileCount, 1);
+  assert.match(context.collectionGuidance, /primary evidence/i);
+  assert.match(context.content, /INLINE_MARKER/);
+});
+
+test("collectReviewContext falls back to lightweight context for larger adversarial reviews", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "a.js", "b.js", "c.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "a.js"), 'export const value = "SELF_COLLECT_MARKER_A";\n');
+  fs.writeFileSync(path.join(cwd, "b.js"), 'export const value = "SELF_COLLECT_MARKER_B";\n');
+  fs.writeFileSync(path.join(cwd, "c.js"), 'export const value = "SELF_COLLECT_MARKER_C";\n');
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(context.inputMode, "self-collect");
+  assert.equal(context.fileCount, 3);
+  assert.match(context.collectionGuidance, /lightweight summary/i);
+  assert.match(context.collectionGuidance, /read-only git commands/i);
+  assert.doesNotMatch(context.content, /SELF_COLLECT_MARKER_[ABC]/);
+  assert.match(context.content, /## Changed Files/);
+});

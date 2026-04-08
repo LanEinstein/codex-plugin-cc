@@ -5,6 +5,7 @@ import { isProbablyText } from "./fs.mjs";
 import { runCommand, runCommandChecked } from "./process.mjs";
 
 const MAX_UNTRACKED_BYTES = 24 * 1024;
+const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
 
 function git(cwd, args, options = {}) {
   return runCommand("git", args, { cwd, ...options });
@@ -12,6 +13,27 @@ function git(cwd, args, options = {}) {
 
 function gitChecked(cwd, args, options = {}) {
   return runCommandChecked("git", args, { cwd, ...options });
+}
+
+function listUniqueFiles(...groups) {
+  return [...new Set(groups.flat().filter(Boolean))].sort();
+}
+
+function normalizeMaxInlineFiles(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_INLINE_DIFF_MAX_FILES;
+  }
+  return Math.floor(parsed);
+}
+
+function buildBranchComparison(cwd, baseRef) {
+  const mergeBase = gitChecked(cwd, ["merge-base", "HEAD", baseRef]).stdout.trim();
+  return {
+    mergeBase,
+    commitRange: `${mergeBase}..HEAD`,
+    reviewRange: `${baseRef}...HEAD`
+  };
 }
 
 export function ensureGitRepository(cwd) {
@@ -148,55 +170,95 @@ function formatUntrackedFile(cwd, relativePath) {
   return [`### ${relativePath}`, "```", buffer.toString("utf8").trimEnd(), "```"].join("\n");
 }
 
-function collectWorkingTreeContext(cwd, state) {
-  const status = gitChecked(cwd, ["status", "--short"]).stdout.trim();
-  const stagedDiff = gitChecked(cwd, ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
-  const unstagedDiff = gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
-  const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+function collectWorkingTreeContext(cwd, state, options = {}) {
+  const includeDiff = options.includeDiff !== false;
+  const status = gitChecked(cwd, ["status", "--short", "--untracked-files=all"]).stdout.trim();
+  const changedFiles = listUniqueFiles(state.staged, state.unstaged, state.untracked);
 
-  const parts = [
-    formatSection("Git Status", status),
-    formatSection("Staged Diff", stagedDiff),
-    formatSection("Unstaged Diff", unstagedDiff),
-    formatSection("Untracked Files", untrackedBody)
-  ];
+  let parts;
+  if (includeDiff) {
+    const stagedDiff = gitChecked(cwd, ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
+    const unstagedDiff = gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
+    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    parts = [
+      formatSection("Git Status", status),
+      formatSection("Staged Diff", stagedDiff),
+      formatSection("Unstaged Diff", unstagedDiff),
+      formatSection("Untracked Files", untrackedBody)
+    ];
+  } else {
+    const stagedStat = gitChecked(cwd, ["diff", "--shortstat", "--cached"]).stdout.trim();
+    const unstagedStat = gitChecked(cwd, ["diff", "--shortstat"]).stdout.trim();
+    parts = [
+      formatSection("Git Status", status),
+      formatSection("Staged Diff Stat", stagedStat),
+      formatSection("Unstaged Diff Stat", unstagedStat),
+      formatSection("Changed Files", changedFiles.join("\n"))
+    ];
+  }
 
   return {
     mode: "working-tree",
     summary: `Reviewing ${state.staged.length} staged, ${state.unstaged.length} unstaged, and ${state.untracked.length} untracked file(s).`,
-    content: parts.join("\n")
+    content: parts.join("\n"),
+    changedFiles
   };
 }
 
-function collectBranchContext(cwd, baseRef) {
-  const mergeBase = gitChecked(cwd, ["merge-base", "HEAD", baseRef]).stdout.trim();
-  const commitRange = `${mergeBase}..HEAD`;
+function collectBranchContext(cwd, baseRef, options = {}) {
+  const includeDiff = options.includeDiff !== false;
+  const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef);
   const currentBranch = getCurrentBranch(cwd);
-  const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", commitRange]).stdout.trim();
-  const diffStat = gitChecked(cwd, ["diff", "--stat", commitRange]).stdout.trim();
-  const diff = gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff", commitRange]).stdout;
+  const changedFiles = gitChecked(cwd, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean);
+  const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout.trim();
+  const diffStat = gitChecked(cwd, ["diff", "--stat", comparison.commitRange]).stdout.trim();
 
   return {
     mode: "branch",
-    summary: `Reviewing branch ${currentBranch} against ${baseRef} from merge-base ${mergeBase}.`,
-    content: [
-      formatSection("Commit Log", logOutput),
-      formatSection("Diff Stat", diffStat),
-      formatSection("Branch Diff", diff)
-    ].join("\n")
+    summary: `Reviewing branch ${currentBranch} against ${baseRef} from merge-base ${comparison.mergeBase}.`,
+    content: includeDiff
+      ? [
+          formatSection("Commit Log", logOutput),
+          formatSection("Diff Stat", diffStat),
+          formatSection(
+            "Branch Diff",
+            gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange]).stdout
+          )
+        ].join("\n")
+      : [
+          formatSection("Commit Log", logOutput),
+          formatSection("Diff Stat", diffStat),
+          formatSection("Changed Files", changedFiles.join("\n"))
+        ].join("\n"),
+    changedFiles,
+    comparison
   };
 }
 
-export function collectReviewContext(cwd, target) {
+function buildAdversarialCollectionGuidance(options = {}) {
+  if (options.includeDiff !== false) {
+    return "Use the repository context below as primary evidence.";
+  }
+
+  return "The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.";
+}
+
+export function collectReviewContext(cwd, target, options = {}) {
   const repoRoot = getRepoRoot(cwd);
-  const state = getWorkingTreeState(cwd);
-  const currentBranch = getCurrentBranch(cwd);
+  const currentBranch = getCurrentBranch(repoRoot);
+  const maxInlineFiles = normalizeMaxInlineFiles(options.maxInlineFiles);
   let details;
+  let includeDiff;
 
   if (target.mode === "working-tree") {
-    details = collectWorkingTreeContext(repoRoot, state);
+    const state = getWorkingTreeState(repoRoot);
+    includeDiff = options.includeDiff ?? listUniqueFiles(state.staged, state.unstaged, state.untracked).length <= maxInlineFiles;
+    details = collectWorkingTreeContext(repoRoot, state, { includeDiff });
   } else {
-    details = collectBranchContext(repoRoot, target.baseRef);
+    const comparison = buildBranchComparison(repoRoot, target.baseRef);
+    const fileCount = gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean).length;
+    includeDiff = options.includeDiff ?? fileCount <= maxInlineFiles;
+    details = collectBranchContext(repoRoot, target.baseRef, { includeDiff, comparison });
   }
 
   return {
@@ -204,6 +266,9 @@ export function collectReviewContext(cwd, target) {
     repoRoot,
     branch: currentBranch,
     target,
+    fileCount: details.changedFiles.length,
+    inputMode: includeDiff ? "inline-diff" : "self-collect",
+    collectionGuidance: buildAdversarialCollectionGuidance({ includeDiff }),
     ...details
   };
 }
