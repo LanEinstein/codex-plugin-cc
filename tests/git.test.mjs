@@ -141,3 +141,25 @@ test("collectReviewContext falls back to lightweight context for larger adversar
   assert.doesNotMatch(context.content, /SELF_COLLECT_MARKER_[ABC]/);
   assert.match(context.content, /## Changed Files/);
 });
+
+test("collectReviewContext keeps untracked file content in lightweight working tree context", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  for (const name of ["a.js", "b.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "a.js", "b.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "a.js"), 'export const value = "TRACKED_MARKER_A";\n');
+  fs.writeFileSync(path.join(cwd, "b.js"), 'export const value = "TRACKED_MARKER_B";\n');
+  fs.writeFileSync(path.join(cwd, "new-risk.js"), 'export const value = "UNTRACKED_RISK_MARKER";\n');
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(context.inputMode, "self-collect");
+  assert.equal(context.fileCount, 3);
+  assert.doesNotMatch(context.content, /TRACKED_MARKER_[AB]/);
+  assert.match(context.content, /## Untracked Files/);
+  assert.match(context.content, /UNTRACKED_RISK_MARKER/);
+});
