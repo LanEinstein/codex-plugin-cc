@@ -1,13 +1,16 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Codex Consult Output",
-  "description": "Structured advisory output returned by /codex:consult. Claude Code reads this JSON and integrates it as supplementary input while remaining the canonical planner.",
+  "description": "Structured advisory output returned by /codex:consult. Claude Code reads this JSON and integrates it as supplementary input while remaining the canonical planner. All fields are required to satisfy OpenAI strict structured-output mode; use empty strings or empty arrays where a value is not meaningful.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "mode",
     "summary",
-    "findings"
+    "confidence",
+    "findings",
+    "disagreements",
+    "open_questions"
   ],
   "properties": {
     "mode": {
@@ -20,8 +23,7 @@
     },
     "summary": {
       "type": "string",
-      "minLength": 1,
-      "maxLength": 1200
+      "description": "One-paragraph TL;DR Claude can scan first. Non-empty."
     },
     "confidence": {
       "type": "string",
@@ -33,21 +35,20 @@
     },
     "findings": {
       "type": "array",
-      "minItems": 0,
-      "maxItems": 20,
+      "description": "0-20 findings, ordered by importance. Empty array is allowed (e.g. a plan-critique with no material concerns).",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": [
           "title",
           "severity",
-          "detail"
+          "detail",
+          "evidence",
+          "suggestion"
         ],
         "properties": {
           "title": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 160
+            "type": "string"
           },
           "severity": {
             "type": "string",
@@ -60,23 +61,22 @@
             ]
           },
           "detail": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           },
           "evidence": {
             "type": "string",
-            "description": "Optional citation: plan heading, file path, line range, or name of principle referenced."
+            "description": "Citation (plan heading, file path, principle). Use empty string when not applicable."
           },
           "suggestion": {
             "type": "string",
-            "description": "Optional concrete next step — advisory only. Claude decides whether to act on it."
+            "description": "Concrete advisory next step. Use empty string when Claude has already decided the path forward."
           }
         }
       }
     },
     "disagreements": {
       "type": "array",
-      "description": "Only populated in mode=\"second-opinion\". Each entry contrasts Codex's view with Claude's stated view.",
+      "description": "Only populated in mode=\"second-opinion\". Use empty array for other modes or when fully agreeing with Claude.",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -87,26 +87,22 @@
         ],
         "properties": {
           "claude_view": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           },
           "codex_view": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           },
           "reasoning": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           }
         }
       }
     },
     "open_questions": {
       "type": "array",
-      "description": "Sub-questions Codex could not resolve from the provided context. Claude should treat these as next steps to investigate.",
+      "description": "Sub-questions Codex could not resolve from the provided context. Use empty array when none.",
       "items": {
-        "type": "string",
-        "minLength": 1
+        "type": "string"
       }
     }
   }
