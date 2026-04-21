@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Consult Output",
+  "description": "Structured advisory output returned by /codex:consult. Claude Code reads this JSON and integrates it as supplementary input while remaining the canonical planner.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "mode",
+    "summary",
+    "findings"
+  ],
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": [
+        "plan-critique",
+        "investigate",
+        "second-opinion"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1200
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title",
+          "severity",
+          "detail"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low",
+              "info"
+            ]
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Optional citation: plan heading, file path, line range, or name of principle referenced."
+          },
+          "suggestion": {
+            "type": "string",
+            "description": "Optional concrete next step — advisory only. Claude decides whether to act on it."
+          }
+        }
+      }
+    },
+    "disagreements": {
+      "type": "array",
+      "description": "Only populated in mode=\"second-opinion\". Each entry contrasts Codex's view with Claude's stated view.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "claude_view",
+          "codex_view",
+          "reasoning"
+        ],
+        "properties": {
+          "claude_view": {
+            "type": "string",
+            "minLength": 1
+          },
+          "codex_view": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reasoning": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "description": "Sub-questions Codex could not resolve from the provided context. Claude should treat these as next steps to investigate.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}
