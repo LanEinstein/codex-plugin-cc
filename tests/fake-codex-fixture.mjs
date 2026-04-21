@@ -1,3 +1,5 @@
+// Modified 2026 by LanEinstein — added consult mode handler, consult failure-injection behaviors. See NOTICE.
+
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -216,6 +218,48 @@ function structuredReviewPayload(prompt) {
   });
 }
 
+function detectConsultMode(prompt) {
+  if (prompt.includes("<plan_under_review>")) return "plan-critique";
+  if (prompt.includes("<decision>") && prompt.includes("<claude_initial_view>")) return "second-opinion";
+  return "investigate";
+}
+
+function structuredConsultPayload(prompt) {
+  if (BEHAVIOR === "consult-unstructured") {
+    return "this is definitely not json";
+  }
+  const mode = detectConsultMode(prompt);
+  const base = {
+    mode,
+    summary: BEHAVIOR === "consult-empty-findings"
+      ? "Looked fine overall."
+      : "Codex identified concrete findings for Claude to weigh.",
+    confidence: "medium",
+    findings: BEHAVIOR === "consult-empty-findings"
+      ? []
+      : [
+          {
+            title: "Sample finding from fake codex",
+            severity: mode === "plan-critique" ? "high" : "medium",
+            detail: "Detailed rationale about the issue so Claude can integrate it.",
+            evidence: "fake-fixture://consult-" + mode,
+            suggestion: "Consider addressing this before proceeding."
+          }
+        ],
+    open_questions: ["Is there an uncovered edge case?"]
+  };
+  if (mode === "second-opinion") {
+    base.disagreements = [
+      {
+        claude_view: "Claude's view as stated in the context.",
+        codex_view: "Codex's alternative view for second-opinion mode.",
+        reasoning: "This fake rationale explains the trade-off."
+      }
+    ];
+  }
+  return JSON.stringify(base);
+}
+
 function taskPayload(prompt, resume) {
   if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
     if (BEHAVIOR === "adversarial-clean") {
@@ -373,6 +417,34 @@ rl.on("line", (line) => {
           .filter((item) => item.type === "text")
           .map((item) => item.text)
           .join("\\n");
+
+        // Detect consult schema up-front so failure injection can run before
+        // any success response is sent (otherwise the JSON-RPC id has already
+        // been resolved and a subsequent "error" reply is a protocol violation).
+        const outputSchema = message.params.outputSchema;
+        const isConsultSchema = Boolean(
+          outputSchema
+            && outputSchema.properties
+            && outputSchema.properties.mode
+            && outputSchema.properties.mode.enum
+            && outputSchema.properties.mode.enum.includes("plan-critique")
+        );
+        const isReviewSchema = Boolean(
+          outputSchema && outputSchema.properties && outputSchema.properties.verdict
+        );
+
+        if (isConsultSchema) {
+          if (BEHAVIOR === "consult-quota-fail") {
+            throw new Error("quota exceeded: rate_limit 429");
+          }
+          if (BEHAVIOR === "consult-network-fail") {
+            throw new Error("fetch failed: ECONNREFUSED upstream.example");
+          }
+          if (BEHAVIOR === "consult-auth-turn-fail") {
+            throw new Error("authentication expired; run codex login");
+          }
+        }
+
         const turnId = nextTurnId(state);
         thread.updatedAt = now();
 	        state.lastTurnStart = {
@@ -385,9 +457,18 @@ rl.on("line", (line) => {
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
-        const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
-          ? structuredReviewPayload(prompt)
-          : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+        if (isConsultSchema && BEHAVIOR === "consult-hang") {
+          // Send only turn/started; omit turn/completed so the client waits
+          // until Claude-side timeout fires.
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          break;
+        }
+
+        const payload = isConsultSchema
+          ? structuredConsultPayload(prompt)
+          : isReviewSchema
+            ? structuredReviewPayload(prompt)
+            : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
 
         if (
           BEHAVIOR === "with-subagent" ||
