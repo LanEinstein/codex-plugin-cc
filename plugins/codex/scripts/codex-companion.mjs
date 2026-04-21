@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// Modified 2026 by LanEinstein — added consult subcommand and handler (advisory-only). See NOTICE.
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -64,6 +65,11 @@ import {
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
+const CONSULT_SCHEMA = path.join(ROOT_DIR, "schemas", "consult-output.schema.json");
+const CONSULT_MODES = new Set(["plan-critique", "investigate", "second-opinion"]);
+const DEFAULT_CONSULT_TIMEOUT_SECONDS = 90;
+const MIN_CONSULT_TIMEOUT_SECONDS = 1;
+const CONSULT_SKIP_SENTINEL = "> [!WARNING] Codex oracle unavailable";
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
@@ -77,6 +83,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs consult <plan-critique|investigate|second-opinion> [target] [--timeout <seconds>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--context-file <path>]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -729,6 +736,195 @@ async function handleReview(argv) {
   });
 }
 
+// --- Consult (fork addition: advisory Codex pass, graceful skip on unavailability) ---
+
+function sanitizeConsultError(message) {
+  const firstLine = String(message ?? "").split(/\r?\n/).find((line) => line.trim()) ?? "";
+  return firstLine.length > 240 ? `${firstLine.slice(0, 237)}...` : firstLine;
+}
+
+function classifyConsultError(error, timeoutSeconds) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (message.startsWith("CONSULT_TIMEOUT:")) {
+    return { reason: "timeout", detail: `Codex did not respond within ${timeoutSeconds}s.` };
+  }
+  if (/Codex CLI is not installed|app-server --help/i.test(message)) {
+    return { reason: "not_installed", detail: sanitizeConsultError(message) };
+  }
+  if (/unauthor|401\b|login|authentication expired/i.test(message)) {
+    return { reason: "auth", detail: sanitizeConsultError(message) };
+  }
+  if (/quota|rate[- ]?limit|429\b|insufficient_quota/i.test(message)) {
+    return { reason: "quota", detail: sanitizeConsultError(message) };
+  }
+  if (/ENOTFOUND|ECONNREFUSED|ETIMEDOUT|fetch failed|socket hang up|network/i.test(message)) {
+    return { reason: "network", detail: sanitizeConsultError(message) };
+  }
+  return { reason: "unknown", detail: sanitizeConsultError(message) };
+}
+
+function emitConsultSkip(reason, detail = "") {
+  const hints = {
+    auth: "Run `/codex:setup` to authenticate.",
+    quota: "Codex usage limit reached.",
+    timeout: "Increase --timeout or retry later.",
+    network: "Check your network connection.",
+    not_installed: "Run `/codex:setup` to install Codex.",
+    unknown: "See detail below."
+  };
+  const hint = hints[reason] ?? hints.unknown;
+  const sanitized = detail ? sanitizeConsultError(detail) : "";
+  const detailSuffix = sanitized ? ` Detail: ${sanitized}` : "";
+  const message =
+    `${CONSULT_SKIP_SENTINEL} — reason: ${reason}\n` +
+    `> ${hint}${detailSuffix} Proceeding without Codex input.\n`;
+  // Use fs.writeSync + explicit exit so a lingering Codex broker connection
+  // (e.g. after timeout abandons runAppServerTurn) cannot keep the event
+  // loop alive. Skip is graceful completion from Claude's perspective.
+  fs.writeSync(1, message);
+  process.exit(0);
+}
+
+function resolveConsultTarget(cwd, mode, positionals) {
+  const targetText = positionals.slice(1).join(" ").trim();
+  if (!targetText) {
+    throw new Error(
+      `A target is required for consult ${mode}. Provide inline text or a file path.`
+    );
+  }
+  if (mode !== "plan-critique") {
+    return { label: shorten(targetText, 120), body: targetText };
+  }
+  const resolvedPath = path.resolve(cwd, targetText);
+  if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isFile()) {
+    const body = fs.readFileSync(resolvedPath, "utf8");
+    const label = path.relative(cwd, resolvedPath) || resolvedPath;
+    return { label, body };
+  }
+  return { label: shorten(targetText, 120), body: targetText };
+}
+
+function readConsultContextFile(cwd, contextFile) {
+  if (!contextFile) {
+    return "";
+  }
+  const contextPath = path.resolve(cwd, contextFile);
+  if (!fs.existsSync(contextPath)) {
+    throw new Error(`--context-file not found: ${contextPath}`);
+  }
+  return fs.readFileSync(contextPath, "utf8");
+}
+
+async function handleConsult(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["model", "effort", "cwd", "timeout", "context-file"],
+    booleanOptions: ["json"],
+    aliasMap: {
+      m: "model"
+    }
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+
+  // 1. Codex availability preflight (graceful skip on missing CLI).
+  const availability = getCodexAvailability(cwd);
+  if (!availability.available) {
+    emitConsultSkip("not_installed", availability.detail);
+    return;
+  }
+
+  // 2. Validate mode (programmer error if invalid — throws to main()).
+  const mode = positionals[0];
+  if (!mode || !CONSULT_MODES.has(mode)) {
+    throw new Error(
+      `Usage: consult <plan-critique|investigate|second-opinion> [target]. Got: ${mode ?? "(missing)"}.`
+    );
+  }
+
+  // 3. Assemble target (file for plan-critique, inline text otherwise).
+  const { label: targetLabel, body: targetBody } = resolveConsultTarget(cwd, mode, positionals);
+
+  // 4. Optional context file.
+  const contextBody = readConsultContextFile(cwd, options["context-file"]);
+
+  // 5. Auth preflight (graceful skip on auth failure).
+  const authStatus = await getCodexAuthStatus(cwd);
+  if (!authStatus.loggedIn && authStatus.requiresOpenaiAuth !== false) {
+    emitConsultSkip("auth", authStatus.detail || "Codex login required.");
+    return;
+  }
+
+  // 6. Prompt assembly.
+  const template = loadPromptTemplate(ROOT_DIR, `consult-${mode}`);
+  const prompt = interpolateTemplate(template, {
+    TARGET_LABEL: targetLabel,
+    TARGET: targetBody,
+    CONTEXT: contextBody || "(no additional context provided)"
+  });
+
+  // 7. Timeout + error-classified execution.
+  const requestedTimeout = parseInt(options.timeout, 10);
+  const timeoutSeconds = Math.max(
+    MIN_CONSULT_TIMEOUT_SECONDS,
+    Number.isFinite(requestedTimeout) && requestedTimeout > 0
+      ? requestedTimeout
+      : DEFAULT_CONSULT_TIMEOUT_SECONDS
+  );
+  const timeoutMs = timeoutSeconds * 1000;
+  const model = normalizeRequestedModel(options.model);
+  const effort = normalizeReasoningEffort(options.effort);
+  const outputSchema = readOutputSchema(CONSULT_SCHEMA);
+
+  let timeoutHandle = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutHandle = setTimeout(
+      () => reject(new Error(`CONSULT_TIMEOUT:${timeoutSeconds}`)),
+      timeoutMs
+    );
+  });
+
+  let result;
+  try {
+    result = await Promise.race([
+      runAppServerTurn(workspaceRoot, {
+        prompt,
+        model,
+        effort,
+        sandbox: "read-only",
+        outputSchema
+      }),
+      timeoutPromise
+    ]);
+  } catch (error) {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+    const { reason, detail } = classifyConsultError(error, timeoutSeconds);
+    emitConsultSkip(reason, detail);
+    return;
+  }
+  if (timeoutHandle) {
+    clearTimeout(timeoutHandle);
+  }
+
+  // 8. Parse Codex output and emit structured envelope.
+  const parsed = parseStructuredOutput(result.finalMessage);
+  const envelope = parsed.parsed
+    ? { mode, ...parsed.parsed }
+    : {
+        mode,
+        status: "unstructured",
+        raw: result.finalMessage ?? "",
+        parseError: parsed.parseError ?? "No final message from Codex."
+      };
+
+  // Consult output is structured for Claude to consume; always emit JSON.
+  outputResult(envelope, true);
+}
+
+// --- End consult addition ---
+
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
@@ -996,6 +1192,9 @@ async function main() {
       await handleReviewCommand(argv, {
         reviewName: "Adversarial Review"
       });
+      break;
+    case "consult":
+      await handleConsult(argv);
       break;
     case "task":
       await handleTask(argv);
