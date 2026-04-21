@@ -4,14 +4,14 @@
     "name": "OpenAI"
   },
   "metadata": {
-    "description": "Codex plugins to use in Claude Code for delegation and code review.",
-    "version": "1.0.4"
+    "description": "Codex plugins to use in Claude Code for delegation and code review. Fork adds /codex:consult advisory mode with graceful skip.",
+    "version": "1.1.0-consult.1"
   },
   "plugins": [
     {
       "name": "codex",
-      "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.4",
+      "description": "Use Codex from Claude Code to review code, delegate tasks, and consult as an independent advisor during plan/investigate/thinking phases.",
+      "version": "1.1.0-consult.1",
       "author": {
         "name": "OpenAI"
       },

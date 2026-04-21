@@ -11,3 +11,33 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+-----
+
+Modifications
+=============
+
+Portions of this work have been modified from the original.
+
+Copyright 2026 LanEinstein <LanEinstein@users.noreply.github.com>
+Licensed under the Apache License, Version 2.0 (the "License").
+
+Modifications in this fork (LanEinstein/codex-plugin-cc):
+  - Added /codex:consult slash command (plugins/codex/commands/consult.md)
+  - Added codex-oracle subagent (plugins/codex/agents/codex-oracle.md)
+  - Added consult subcommand handler in plugins/codex/scripts/codex-companion.mjs
+  - Added prompt templates under plugins/codex/prompts/consult-*.md
+  - Added JSON schema at plugins/codex/schemas/consult-output.schema.json
+  - Extended tests/fake-codex-fixture.mjs with consult mode handler and
+    FAKE_CODEX_FAIL-style failure-injection behaviors
+  - Added tests/consult.test.mjs covering happy paths, graceful-skip matrix,
+    timeout, flag passthrough, and unstructured fallback
+  - Updated tests/commands.test.mjs to include consult.md in the exposed
+    command file inventory
+  - Added bilingual Chinese README (README.zh.md)
+  - Bumped plugin version to 1.1.0-consult.1 in .claude-plugin/marketplace.json
+    and plugins/codex/.claude-plugin/plugin.json
+
+Modified source files carry a header comment "Modified 2026 by LanEinstein"
+per Apache-2.0 §4(b). New source files carry a standard Apache-2.0
+attribution header crediting 2026 LanEinstein.
