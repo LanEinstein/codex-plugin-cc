@@ -1,5 +1,9 @@
 # Codex plugin for Claude Code
 
+**[English](./README.md)** · [中文](./README.zh.md)
+
+> This is a fork of [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc) by [LanEinstein](https://github.com/LanEinstein). See [Fork additions](#fork-additions-laneinstein) for what's new; everything else tracks upstream.
+
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
@@ -275,6 +279,122 @@ Check out the Codex docs for more [configuration options](https://developers.ope
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
 
 This way you can review the Codex work or continue the work there.
+
+<!-- Fork additions below © 2026 LanEinstein. Licensed under Apache-2.0. -->
+
+## Fork additions (LanEinstein)
+
+This section documents features specific to the `LanEinstein/codex-plugin-cc` fork.
+All upstream commands and behaviors remain unchanged.
+
+### `/codex:consult` — Codex as an independent advisor
+
+During Claude Code's plan / investigate / thinking phases, delegate a specific advisory question to Codex. Claude remains canonical; Codex's structured output is supplementary information that Claude reads and integrates as it refines its plan.
+
+Consult is **advisory-only**. Codex runs with `sandbox: read-only` and never modifies files in this flow. No `--write` flag is exposed.
+
+#### Three modes
+
+| Mode | Use when |
+|------|----------|
+| `plan-critique` | Ask Codex to critique a plan document: hidden assumptions, failure modes, simpler alternatives, concrete risks. If the target is a valid file path, the plan contents are read from disk. |
+| `investigate` | Ask Codex to independently investigate a specific question as supplementary research. |
+| `second-opinion` | Ask Codex for a contrasting perspective on a decision. Structured output includes an explicit `disagreements` array contrasting Claude's view with Codex's view. |
+
+#### Usage
+
+```bash
+/codex:consult plan-critique ./path/to/my-plan.md
+/codex:consult investigate "Is SQLite safe for concurrent writes across processes?"
+/codex:consult second-opinion "Redis vs Postgres for a durable job queue at 1k qps"
+```
+
+#### Flags
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--timeout <seconds>` | `90` | Hard timeout. On expiry Codex oracle skips gracefully (`reason=timeout`). |
+| `--model <model>` | auto (Codex default) | Override Codex model. Accepts `spark` → `gpt-5.3-codex-spark`. |
+| `--effort <level>` | auto | Reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`. |
+| `--context-file <path>` | — | Read supplementary context from a file. For `second-opinion`, use this to pass Claude's initial view. |
+
+Consult runs in the foreground only in this release. Background mode is not supported.
+
+#### Output
+
+On success, consult emits a JSON object to stdout matching [`plugins/codex/schemas/consult-output.schema.json`](./plugins/codex/schemas/consult-output.schema.json):
+
+```json
+{
+  "mode": "plan-critique",
+  "summary": "One-paragraph ship/no-ship take on the plan.",
+  "confidence": "medium",
+  "findings": [
+    {
+      "title": "...",
+      "severity": "high",
+      "detail": "...",
+      "evidence": "Plan §3.2",
+      "suggestion": "Add an idempotency guard before retry."
+    }
+  ],
+  "disagreements": [],
+  "open_questions": []
+}
+```
+
+Claude reads this JSON and integrates valuable points into its plan while dismissing ones it disagrees with. Codex's output is supplementary, not canonical.
+
+### `codex-oracle` subagent
+
+Claude can invoke the `codex-oracle` subagent proactively when it decides a plan / investigation / decision benefits from an independent second opinion. The subagent is a thin forwarder to `/codex:consult` — it runs in an isolated context so Codex's output does not pollute the main thread's context window.
+
+When to expect Claude to invoke it automatically:
+
+- Drafting a non-trivial plan and the tradeoffs are unclear
+- Investigating unfamiliar code or a concept Claude is uncertain about
+- Having formed an initial view and wanting a contrasting perspective
+
+Claude will **not** invoke it for trivial asks it can handle directly.
+
+### Graceful degradation
+
+If Codex is unavailable, consult exits 0 and emits a warning block starting with:
+
+```
+> [!WARNING] Codex oracle unavailable — reason: <class>
+> <hint> Proceeding without Codex input.
+```
+
+Claude detects this sentinel and proceeds without Codex input. **Consult unavailability never blocks Claude's progress.** Skip is classified into one of:
+
+| Reason | Typical cause | Hint surfaced to Claude |
+|--------|---------------|-------------------------|
+| `auth` | Codex login missing or 401 | Run `/codex:setup` to authenticate. |
+| `quota` | Usage limit reached / 429 | Codex usage limit reached. |
+| `timeout` | No response within `--timeout` | Increase `--timeout` or retry later. |
+| `network` | Connection refused / DNS failure | Check your network connection. |
+| `not_installed` | Codex CLI absent or broken | Run `/codex:setup` to install Codex. |
+| `unknown` | Any other error | See detail line. |
+
+All skip paths exit 0 because absence of a supplementary signal is not an error from Claude's perspective.
+
+### Install this fork
+
+```bash
+/plugin marketplace add LanEinstein/codex-plugin-cc
+/plugin install codex@openai-codex
+/reload-plugins
+/codex:setup
+```
+
+The fork preserves the upstream package name (`openai-codex`) and bumps the version to `1.1.0-consult.1`. Existing `/codex:review`, `/codex:rescue`, etc. continue to work identically to upstream.
+
+### License
+
+Apache-2.0, inherited from upstream. See [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).
+
+<!-- End fork additions -->
 
 ## FAQ
 
